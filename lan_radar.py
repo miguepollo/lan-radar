@@ -40,6 +40,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from concurrent import futures
@@ -76,21 +77,23 @@ DNS_BUDGET = 8.0  # segundos totales para resolución de hostnames por escaneo
 MAX_HOSTS = 512
 MDNS_TIMEOUT = 1.0  # avahi-resolve-address cuelga si no hay registro mDNS
 NMB_TIMEOUT = 1.0  # nmblookup -A a hosts sin NetBIOS tarda en dar timeout
-PORT_TIMEOUT = 0.35  # por puerto; todos los (ip, puerto) van en paralelo
+PORT_TIMEOUT = 0.25  # por puerto; todos los (ip, puerto) van en paralelo
 PORT_WORKERS = 100
 # Timeouts de los resolvers nativos (multicast-respuestas llegan en ms)
-GWDNS_TIMEOUT = 1.0  # PTR directo al router por IP
-NATIVE_MDNS_TIMEOUT = 0.9  # mDNS reverso 224.0.0.251:5353
-NATIVE_LLMNR_TIMEOUT = 0.9  # LLMNR reverso 224.0.0.252:5355
-NATIVE_NBNS_TIMEOUT = 0.9  # NetBIOS NBSTAT directo UDP/137
+GWDNS_TIMEOUT = 0.6  # PTR directo al router por IP
+NATIVE_MDNS_TIMEOUT = 0.4  # mDNS reverso 224.0.0.251:5353
+NATIVE_LLMNR_TIMEOUT = 0.4  # LLMNR reverso 224.0.0.252:5355
+NATIVE_NBNS_TIMEOUT = 0.4  # NetBIOS NBSTAT directo UDP/137
 SSDP_TIMEOUT = 3.0  # un M-SEARCH caza TVs/altavoces/NAS de golpe
 SSDP_FETCH_TIMEOUT = 2.0  # descarga del XML de descripción UPnP
 BROWSE_TIMEOUT = 4  # techo para avahi-browse -r (se aprovecha salida parcial)
 # Puertos para el "knock" TCP que fuerza al kernel a resolver ARP.
 # Solo se prueban en IPs que NO respondieron al ping: así aparecen móviles
 # en reposo (5GHz) e IoTs baratos que ignoran ICMP pero contestan ARP.
-TCP_ARP_PORTS = (80, 443, 445, 22)
-TCP_ARP_TIMEOUT = 0.25
+# Solo 80/443: basta para forzar ARP, el fingerprint completo ya lo hace
+# probe_all_ports en los vivos.
+TCP_ARP_PORTS = (80, 443)
+TCP_ARP_TIMEOUT = 0.15
 TCP_ARP_WORKERS = 100
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "lan-radar"
@@ -1028,12 +1031,11 @@ def short_mac(mac):
 
 def _check_port(args):
     ip, port, timeout = args
-    for _ in range(2):  # reintento: los IoT lentos a veces pierden el primer SYN
-        try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                return ip, port
-        except Exception:
-            continue
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return ip, port
+    except Exception:
+        pass
     return ip, None
 
 
@@ -1181,123 +1183,231 @@ class Scanner:
                 pass
         return servers
 
-    def scan(self, progress_cb=None):
-        """Ping sweep + boost TCP→ARP. Retorna Devices online ordenados por IP."""
+    def scan_with_updates(self, on_upsert=None, on_progress=None):
+        """Escaneo progresivo (lazy loading).
+
+        Va llamando a ``on_upsert(snapshot)`` cada vez que aparece o se
+        enriquece un dispositivo, para que la UI pinte al instante y vaya
+        rellenando filas a medida que llegan ping → ARP → nombres → puertos.
+
+        ``on_progress(phase, done, total)`` con phase en
+        {"ping", "arp", "nombres", "puertos"} sirve para el banner
+        "⏳ Todavía escaneando…".
+        Retorna la lista final ordenada por IP (igual que scan()).
+        """
         hosts = self._all_hosts()
-
-        ping_results = {}
-        with futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futs = {ex.submit(ping_host, ip, self.timeout): ip for ip in hosts}
-            for done, fut in enumerate(futures.as_completed(futs), 1):
-                try:
-                    ping_results[futs[fut]] = fut.result()
-                except Exception:
-                    ping_results[futs[fut]] = (False, None, None)
-                if progress_cb:
-                    progress_cb(done, len(hosts))
-
-        online_ips = [ip for ip, (on, _, _) in ping_results.items() if on]
-        lat_map = {ip: lat for ip, (_on, lat, _t) in ping_results.items()}
-        ttl_map = {ip: ttl for ip, (_on, _l, ttl) in ping_results.items()}
-
-        # ── Boost: IPs mudas al ping pero vivas en ARP/TCP (típico 5GHz/IoT)
-        # Solo promociona con prueba fresca (evita fantasmas STALE de ayer):
-        #   - el knock abrió ≥1 puerto TCP → vivo seguro, o
-        #   - ip neigh lo marca REACHABLE/DELAY/PERMANENT tras el knock
-        #     (el SYN obliga al kernel a revalidar ARP; lo muerto cae a
-        #     FAILED/INCOMPLETE y se filtra solo).
-        post_arp = {}
-        if self.do_tcp_arp:
-            missed = [ip for ip in hosts if ip not in online_ips and ip != self.own_ip]
-            knock = tcp_arp_boost(missed)
-            time.sleep(0.5)  # deja que el kernel complete la resolución ARP
-            post_arp = get_arp_table()  # ARPs frescos post-knock
-            for ip in missed:
-                if ip in online_ips:
-                    continue
-                if knock.get(ip):  # abrió puerto → vivo seguro
-                    online_ips.append(ip)
-                elif post_arp.get(ip, (None, ""))[1] in ("REACHABLE", "DELAY", "PERMANENT"):
-                    online_ips.append(ip)
-        else:
-            post_arp = get_arp_table()
-
-        if self.own_ip and self.own_ip not in online_ips:
-            try:
-                if any(ipaddress.ip_address(self.own_ip) in n for n in self.networks):
-                    online_ips.append(self.own_ip)
-                    lat_map.setdefault(self.own_ip, None)
-                    ttl_map.setdefault(self.own_ip, None)
-            except ValueError:
-                pass
-
-        hostname_map = {}
-        # Puertos, SSDP y hostnames son independientes: se resuelven en paralelo.
-        ports_future = ssdp_future = browse_future = None
-        bg = futures.ThreadPoolExecutor(max_workers=3)
-        if self.do_ports and online_ips:
-            ports_future = bg.submit(probe_all_ports, online_ips)
-        if self.do_ssdp:
-            ssdp_future = bg.submit(ssdp_sweep)
-            browse_future = bg.submit(avahi_browse_map)
-        dns_servers = self._dns_servers()
-        if online_ips:
-            # SSDP/browse alimentan la cascada: esperarlos con techo.
-            extra_names = {}
-            if ssdp_future:
-                try:
-                    self._ssdp_info = ssdp_future.result(timeout=SSDP_TIMEOUT + 3)
-                    for ip, info in self._ssdp_info.items():
-                        extra_names.setdefault(ip, info["name"])
-                except Exception:
-                    self._ssdp_info = {}
-            else:
-                self._ssdp_info = {}
-            if browse_future:
-                try:
-                    for ip, name in browse_future.result(timeout=BROWSE_TIMEOUT + 2).items():
-                        extra_names.setdefault(ip, name)
-                except Exception:
-                    pass
-            ex = futures.ThreadPoolExecutor(max_workers=DNS_WORKERS)
-            futs = {ex.submit(resolve_hostname, ip, dns_servers, extra_names): ip for ip in online_ips}
-            try:
-                for fut in futures.as_completed(futs, timeout=DNS_BUDGET):
-                    hostname_map[futs[fut]] = fut.result()
-            except Exception:
-                pass  # presupuesto agotado: el resto queda "unknown"
-            for ip in online_ips:
-                hostname_map.setdefault(ip, "unknown")
-            ex.shutdown(wait=False, cancel_futures=True)
-        else:
-            self._ssdp_info = {}
-
-        ports_map = ports_future.result() if ports_future else {}
-        bg.shutdown(wait=False, cancel_futures=True)
-
-        mac_table = {ip: mac for ip, (mac, _st) in post_arp.items()}
+        total = len(hosts)
+        lat_map: dict = {}
+        ttl_map: dict = {}
+        hostname_map: dict = {}
+        ports_map: dict = {}
+        devices_by_ip: dict[str, Device] = {}
         gateway = get_default_gateway()
         own_host = socket.gethostname().split(".")[0] or "this-device"
-        devices = []
-        for ip in online_ips:
-            hostname = hostname_map.get(ip, "unknown")
+        self._ssdp_info = {}
+
+        def _sorted_snapshot():
+            # Objetos nuevos en cada emit: el snapshot anterior no se muta.
+            return sorted(devices_by_ip.values(), key=lambda d: int(ipaddress.ip_address(d.ip)))
+
+        def _emit():
+            if on_upsert:
+                try:
+                    on_upsert(list(_sorted_snapshot()))
+                except Exception:
+                    pass
+
+        def _prog(phase, done, tot):
+            if on_progress:
+                try:
+                    on_progress(phase, done, tot)
+                except Exception:
+                    pass
+
+        def _partial(ip, mac=None):
+            # Fila "espera": hostname pendiente, icono reloj. Gateway y
+            # este equipo sí se etiquetan desde el principio.
+            lat, ttl = lat_map.get(ip), ttl_map.get(ip)
+            if gateway is not None and ip == gateway:
+                return Device(ip, "…", lat, mac, "⏳", "…", vendor_of(mac), "", [], ttl)
+            icon = "⭐" if ip == self.own_ip else "⏳"
+            return Device(ip, "…", lat, mac, icon, "…", vendor_of(mac), "", [], ttl)
+
+        def _enriched(ip, hostname, ports=()):
+            mac = mac_table.get(ip)
+            lat, ttl = lat_map.get(ip), ttl_map.get(ip)
             if ip == self.own_ip and hostname == "unknown":
                 hostname = own_host
-            mac = mac_table.get(ip)
-            lat = lat_map.get(ip)
-            ttl = ttl_map.get(ip)
-            ports = ports_map.get(ip, [])
-            dtype, icon = classify_device(hostname, ip, mac, ttl, ports, is_gateway=(gateway is not None and ip == gateway))
+            dtype, icon = classify_device(
+                hostname, ip, mac, ttl, ports,
+                is_gateway=(gateway is not None and ip == gateway),
+            )
+            if hostname == "…" and dtype in ("Desconoc", "Equipo"):
+                dtype, icon = "…", ("⭐" if ip == self.own_ip else "⏳")
             if ip == self.own_ip:
                 icon = "⭐"
             vendor = vendor_of(mac)
             if not vendor and ip in self._ssdp_info:
                 vendor = self._ssdp_info[ip].get("vendor", "")
-            devices.append(
-                Device(ip, hostname, lat, mac, icon, dtype, vendor, guess_os(hostname, ttl, ports), ports, ttl)
-            )
-        devices.sort(key=lambda d: int(ipaddress.ip_address(d.ip)))
-        return devices
+            return Device(ip, hostname, lat, mac, icon, dtype, vendor,
+                          guess_os(hostname, ttl, ports), list(ports), ttl)
+
+        # ── 1. Ping sweep: emite cada hit al instante ──
+        with futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(ping_host, ip, self.timeout): ip for ip in hosts}
+            for done, fut in enumerate(futures.as_completed(futs), 1):
+                ip = futs[fut]
+                try:
+                    on, lat, ttl = fut.result()
+                except Exception:
+                    on, lat, ttl = False, None, None
+                lat_map[ip] = lat
+                ttl_map[ip] = ttl
+                if on and ip not in devices_by_ip:
+                    devices_by_ip[ip] = _partial(ip)
+                    _emit()
+                _prog("ping", done, total)
+
+        online_ips = list(devices_by_ip.keys())
+
+        # ── 2. Boost TCP→ARP (los mudos al ping). Los parciales del ping
+        # ya están pintados, así que la UI no se congela durante el knock.
+        post_arp: dict = {}
+        if self.do_tcp_arp:
+            _prog("arp", 0, 1)
+            missed = [ip for ip in hosts if ip not in devices_by_ip and ip != self.own_ip]
+            knock = tcp_arp_boost(missed)
+            time.sleep(0.2)  # deja que el kernel complete la resolución ARP
+            post_arp = get_arp_table()
+            for ip in missed:
+                if ip in devices_by_ip:
+                    continue
+                if knock.get(ip):
+                    lat_map.setdefault(ip, None)
+                    ttl_map.setdefault(ip, None)
+                    devices_by_ip[ip] = _partial(ip, post_arp.get(ip, (None, ""))[0])
+                    _emit()
+                elif post_arp.get(ip, (None, ""))[1] in ("REACHABLE", "DELAY", "PERMANENT"):
+                    lat_map.setdefault(ip, None)
+                    ttl_map.setdefault(ip, None)
+                    devices_by_ip[ip] = _partial(ip, post_arp.get(ip, (None, ""))[0])
+                    _emit()
+            _prog("arp", 1, 1)
+        else:
+            post_arp = get_arp_table()
+
+        if self.own_ip and self.own_ip not in devices_by_ip:
+            try:
+                if any(ipaddress.ip_address(self.own_ip) in n for n in self.networks):
+                    lat_map.setdefault(self.own_ip, None)
+                    ttl_map.setdefault(self.own_ip, None)
+                    devices_by_ip[self.own_ip] = _partial(
+                        self.own_ip, post_arp.get(self.own_ip, (None, ""))[0]
+                    )
+                    _emit()
+            except ValueError:
+                pass
+
+        online_ips = list(devices_by_ip.keys())
+        mac_table = {ip: mac for ip, (mac, _st) in post_arp.items()}
+        # Rellena MACs conocidas sin esperar a los nombres.
+        if mac_table and devices_by_ip:
+            for ip in list(devices_by_ip.keys()):
+                if devices_by_ip[ip].mac is None and ip in mac_table:
+                    devices_by_ip[ip] = _partial(ip, mac_table[ip])
+            _emit()
+
+        # ── 3. Puertos + SSDP + browse en 2º plano mientras resuelve nombres ──
+        ports_future = ssdp_future = browse_future = None
+        bg = futures.ThreadPoolExecutor(max_workers=3)
+        try:
+            if self.do_ports and online_ips:
+                ports_future = bg.submit(probe_all_ports, list(online_ips))
+            if self.do_ssdp:
+                ssdp_future = bg.submit(ssdp_sweep)
+                browse_future = bg.submit(avahi_browse_map)
+
+            # ── 4. Nombres: cada IP resuelta repinta su fila al momento ──
+            dns_servers = self._dns_servers()
+            if online_ips:
+                _prog("nombres", 0, len(online_ips))
+                ex = futures.ThreadPoolExecutor(max_workers=DNS_WORKERS)
+                futs = {ex.submit(resolve_hostname, ip, dns_servers, None): ip for ip in online_ips}
+                done_names = 0
+                try:
+                    for fut in futures.as_completed(futs, timeout=DNS_BUDGET):
+                        ip = futs[fut]
+                        try:
+                            hostname_map[ip] = fut.result() or "unknown"
+                        except Exception:
+                            hostname_map[ip] = "unknown"
+                        devices_by_ip[ip] = _enriched(ip, hostname_map[ip])
+                        done_names += 1
+                        _emit()
+                        _prog("nombres", done_names, len(online_ips))
+                except Exception:
+                    pass  # presupuesto agotado: el resto queda "unknown"
+                for ip in online_ips:
+                    if ip not in hostname_map:
+                        hostname_map[ip] = "unknown"
+                        devices_by_ip[ip] = _enriched(ip, "unknown")
+                if done_names < len(online_ips):
+                    _emit()
+                    _prog("nombres", len(online_ips), len(online_ips))
+                ex.shutdown(wait=False, cancel_futures=True)
+
+                # SSDP/browse rescatan solo los "unknown".
+                if ssdp_future or browse_future:
+                    extra_names: dict = {}
+                    if ssdp_future:
+                        try:
+                            self._ssdp_info = ssdp_future.result(timeout=SSDP_TIMEOUT)
+                            for ip, info in self._ssdp_info.items():
+                                extra_names.setdefault(ip, info["name"])
+                        except Exception:
+                            self._ssdp_info = {}
+                    if browse_future:
+                        try:
+                            for ip, name in browse_future.result(timeout=BROWSE_TIMEOUT).items():
+                                extra_names.setdefault(ip, name)
+                        except Exception:
+                            pass
+                    touched = False
+                    for ip in online_ips:
+                        if hostname_map.get(ip) == "unknown" and ip in extra_names:
+                            hostname_map[ip] = extra_names[ip]
+                            devices_by_ip[ip] = _enriched(
+                                ip, extra_names[ip], ports_map.get(ip, [])
+                            )
+                            touched = True
+                    if touched:
+                        _emit()
+
+            # ── 5. Puertos: segunda oleada que refina TIPO/vendor ──
+            _prog("puertos", 0, 1)
+            try:
+                ports_map = ports_future.result() if ports_future else {}
+            except Exception:
+                ports_map = {}
+            if ports_map:
+                for ip in online_ips:
+                    if ip in ports_map and ports_map[ip] != devices_by_ip[ip].open_ports:
+                        devices_by_ip[ip] = _enriched(
+                            ip, hostname_map.get(ip, "unknown"), ports_map.get(ip, [])
+                        )
+                _emit()
+            _prog("puertos", 1, 1)
+        finally:
+            bg.shutdown(wait=False, cancel_futures=True)
+
+        return _sorted_snapshot()
+
+    def scan(self, progress_cb=None):
+        """Ping sweep + boost TCP→ARP. Retorna Devices online ordenados por IP."""
+        def _on_progress(phase, done, total):
+            if progress_cb and phase == "ping":
+                progress_cb(done, total)
+        return self.scan_with_updates(on_upsert=None, on_progress=_on_progress)
 
 
 # ── Historial persistente ────────────────────────────────────────────────────
@@ -1395,7 +1505,7 @@ def _avg_lat(devices):
     return _lat(sum(lats) / len(lats)) if lats else "[dim]—[/dim]"
 
 
-def render_table(devices, own_ip):
+def render_table(devices, own_ip, scanning=False):
     table = Table(
         box=box.HEAVY,
         show_header=True,
@@ -1422,9 +1532,27 @@ def render_table(devices, own_ip):
     table.add_column("ESTADO", justify="center", width=9, overflow="fold")
 
     if not devices:
-        table.add_row("—", "[dim]—[/dim]", "[dim]sin dispositivos[/dim]", "—", "—", "—", "[dim]—[/dim]")
+        if scanning:
+            table.add_row(
+                "⏳", "[dim]…[/dim]", "[dim italic]todavía escaneando…[/dim italic]",
+                "[dim]…[/dim]", "—", "—", "[yellow]⏳ espera[/yellow]",
+            )
+        else:
+            table.add_row("—", "[dim]—[/dim]", "[dim]sin dispositivos[/dim]", "—", "—", "—", "[dim]—[/dim]")
         return table
     for d in devices:
+        pending = d.hostname == "…" or d.device_type == "…"
+        if pending:
+            table.add_row(
+                d.icon,
+                d.ip,
+                "[dim italic]… buscando[/dim italic]",
+                "[dim]…[/dim]",
+                short_mac(d.mac),
+                _lat(d.latency_ms),
+                "[yellow]⏳ espera[/yellow]",
+            )
+            continue
         host = _esc(d.hostname) + (" [dim](tú)[/dim]" if d.ip == own_ip else "")
         table.add_row(
             d.icon,
@@ -1438,7 +1566,7 @@ def render_table(devices, own_ip):
     return table
 
 
-def render_header(networks, interval, scan_count):
+def render_header(networks, interval, scan_count, scanning=False, progress_str=""):
     if isinstance(networks, (str, ipaddress.IPv4Network)):
         networks = [networks]
     title = Text(
@@ -1446,12 +1574,13 @@ def render_header(networks, interval, scan_count):
         style="bold black on bright_green",
         justify="center",
     )
-    subtitle = Text(
+    sub = (
         f"{nets_label(networks)}  •  escaneo #{scan_count}  •  cada {interval}s"
-        f"  •  {dt.datetime.now().strftime('%H:%M:%S')}",
-        style="dim",
-        justify="center",
+        f"  •  {dt.datetime.now().strftime('%H:%M:%S')}"
     )
+    if scanning:
+        sub += f"  •  ⏳ todavía escaneando{(' ' + progress_str) if progress_str else '…'}"
+    subtitle = Text(sub, style="dim", justify="center")
     grid = Table.grid(expand=True)
     grid.add_column(justify="center")
     grid.add_row(title)
@@ -1459,7 +1588,7 @@ def render_header(networks, interval, scan_count):
     return Panel(grid, box=box.HEAVY, border_style="bright_green", padding=(0, 0))
 
 
-def render_stats(devices, last_scan, networks):
+def render_stats(devices, last_scan, networks, scanning=False, progress_str=""):
     if isinstance(networks, (str, ipaddress.IPv4Network)):
         networks = [networks]
     total = total_hosts(networks)
@@ -1478,6 +1607,12 @@ def render_stats(devices, last_scan, networks):
     t.add_row("Latencia media:", avg)
     t.add_row("Último escaneo:", f"[white]{last_scan}[/white]")
     t.add_row("Rango:", f"[dim]{nets_label(networks)}[/dim]")
+    if scanning:
+        t.add_row(
+            "Estado:",
+            f"[yellow]⏳ Todavía escaneando{(' — ' + progress_str) if progress_str else '…'}"
+            " — van apareciendo[/yellow]",
+        )
     return _panel(t, "[bold bright_green]▣ ESTADO[/bold bright_green]")
 
 
@@ -1633,6 +1768,16 @@ class LANRadarApp:
         self.scan_count = 0
         self.last_scan_str = "—"
         self.own_ip = get_own_ip()
+        # ── Estado lazy: el escaneo corre en 2º plano y la TUI repinta ──
+        self.scanning = False
+        self._progress: dict = {}
+        self._lock = threading.Lock()
+        self._scan_thread: threading.Thread | None = None
+        self._pending_result = None  # lista final del worker, pendiente de commit
+        self._base_by_ip: dict[str, Device] = {}  # último commit: lo visible no parpadea
+        self._first_scan_done = False  # el "todavía escaneando" solo sale la 1ª vez
+        self._force_verbose = False  # 'r' fuerza proceso completo visible
+        self._frozen = False  # 'h' congela la app hasta la próxima 'h'
 
     @property
     def network(self):
@@ -1648,10 +1793,136 @@ class LANRadarApp:
         self.history.record(devs, joined, left)
         return joined, left, fresh
 
+    def _progress_str(self):
+        with self._lock:
+            prog = dict(self._progress)
+        bits = []
+        if "ping" in prog:
+            d, t = prog["ping"]
+            bits.append(f"ping {d}/{t}")
+        if "arp" in prog:
+            bits.append("arp…")
+        if "nombres" in prog:
+            d, t = prog["nombres"]
+            bits.append(f"nombres {d}/{t}")
+        if "puertos" in prog:
+            bits.append("puertos…")
+        pending_n = sum(1 for d in self.devices if d.hostname == "…")
+        if pending_n:
+            bits.append(f"{pending_n} por resolver")
+        return " • ".join(bits)
+
+    def _start_scan_background(self, verbose=False):
+        """Lanza un escaneo en 2º plano. Retorna False si ya había uno en curso.
+
+        verbose=True (tecla 'r'): proceso completo visible — banner
+        "todavía escaneando" + filas ⏳ — casi como arrancar de 0, pero
+        conservando lo ya confirmado (no se vacía para reaparecer igual).
+        """
+        with self._lock:
+            if self._scan_thread is not None and self._scan_thread.is_alive():
+                return False
+            self.scanning = True
+            self._progress = {}
+            self._pending_result = None
+            # Foto de lo ya confirmado: durante el rescan se sigue mostrando
+            # y solo se suma/actualiza, nunca se vacía para reaparecer igual.
+            self._base_by_ip = {d.ip: d for d in self.devices}
+            self._force_verbose = verbose
+            self.scan_count += 1
+            t = threading.Thread(target=self._scan_worker, daemon=True)
+            self._scan_thread = t
+        t.start()
+        return True
+
+    @staticmethod
+    def _merge_snapshot(base_by_ip, snapshot, drop_pending_new=False):
+        """Mezcla parcial del escaneo con lo ya visible.
+
+        - IP nueva pendiente ("…") → se muestra como ⏳ (es alta nueva),
+          salvo drop_pending_new (re-escaneos en silencio: aparece directa
+          cuando ya viene confirmada).
+        - IP conocida + parcial pendiente → se conserva la fila vieja
+          (no parpadea a "… buscando" para volver igual).
+        - IP conocida + parcial confirmada → se actualiza.
+        - IP vieja aún no vista en este escaneo → se conserva hasta el
+          commit final (si se fue, cae ahí con evento left).
+        """
+        if drop_pending_new and base_by_ip:
+            snapshot = [d for d in snapshot
+                        if not ((d.hostname == "…" or d.device_type == "…") and d.ip not in base_by_ip)]
+        partial_by_ip = {d.ip: d for d in snapshot}
+        out = []
+        for ip in set(base_by_ip) | set(partial_by_ip):
+            p, b = partial_by_ip.get(ip), base_by_ip.get(ip)
+            if p is None:
+                out.append(b)
+            elif b is not None and (p.hostname == "…" or p.device_type == "…"):
+                out.append(b)
+            else:
+                out.append(p)
+        out.sort(key=lambda d: int(ipaddress.ip_address(d.ip)))
+        return out
+
+    def _scan_worker(self):
+        with self._lock:
+            base = dict(self._base_by_ip)
+            # En re-escaneos con algo ya visible: silencio total, sin
+            # filas "… buscando" para altas nuevas (entran confirmadas).
+            # Salvo 'r' (verbose): proceso completo visible.
+            silent = self._first_scan_done and len(base) > 0 and not self._force_verbose
+
+        def _on_upsert(snapshot):
+            merged = LANRadarApp._merge_snapshot(base, snapshot, drop_pending_new=silent)
+            with self._lock:
+                self.devices = merged
+
+        def _on_progress(phase, done, total):
+            with self._lock:
+                self._progress[phase] = (done, total)
+
+        try:
+            devs = self.scanner.scan_with_updates(on_upsert=_on_upsert, on_progress=_on_progress)
+        except Exception:
+            devs = sorted(base.values(), key=lambda d: int(ipaddress.ip_address(d.ip)))
+        with self._lock:
+            self._pending_result = devs
+
+    def _poll_scan_finished(self):
+        """Si el worker terminó, hace commit (historial/diff) en el hilo UI."""
+        with self._lock:
+            if self._pending_result is None:
+                return None
+            # ¿sigue corriendo? solo commiteamos cuando el hilo ya murió
+            # (evita comerse un snapshot intermedio: _pending_result solo se
+            # fija al final del worker, así que basta con recogerlo).
+            devs = self._pending_result
+            self._pending_result = None
+            self.scanning = False
+            self._progress = {}
+            self._first_scan_done = True
+            self._force_verbose = False
+        self.devices = devs
+        self.last_scan_str = dt.datetime.now().strftime("%H:%M:%S")
+        joined, left, fresh = self.diff_and_record(devs)
+        self.prev_ips = {d.ip for d in devs}
+        return devs, joined, left, fresh
+
+    def _show_scanning(self):
+        """El banner/filas 'todavía escaneando' solo la 1ª vez (o sin nada
+        confirmado aún), o cuando 'r' fuerza proceso completo visible:
+        los re-escaneos automáticos refrescan en silencio."""
+        with self._lock:
+            return bool(self.scanning and (
+                self._force_verbose or not self._first_scan_done or not self._base_by_ip
+            ))
+
     def build_renderable(self):
-        header = render_header(self.networks, self.interval, self.scan_count)
-        table = render_table(self.devices, self.own_ip)
-        stats = render_stats(self.devices, self.last_scan_str, self.networks)
+        show = self._show_scanning()
+        prog = self._progress_str() if show else ""
+        header = render_header(self.networks, self.interval, self.scan_count, show, prog)
+        table = render_table(self.devices, self.own_ip, show)
+        stats = render_stats(self.devices, self.last_scan_str, self.networks, show, prog)
         hist = render_history(self.history.recent())
         graph = render_graph(self.history.snapshots)
         body = Table.grid(expand=True, padding=(0, 0))
@@ -1679,21 +1950,18 @@ class LANRadarApp:
 
     def run_once(self):
         self.scan_count += 1
+        self.scanning = True
         devs = self.scanner.scan()
         self.devices = devs
+        self.scanning = False
         self.last_scan_str = dt.datetime.now().strftime("%H:%M:%S")
         out = self.diff_and_record(devs)
         self.prev_ips = {d.ip for d in devs}
         return devs, *out
 
     def run_tui(self):
-        console.clear()
-        console.print(
-            f"[bright_green]📡 LAN RADAR {VERSION}[/bright_green]"
-            f" [dim]• {nets_label(self.networks)} • cada {self.interval}s[/dim]"
-        )
-        console.print(f"[dim]Escaneando {total_hosts(self.networks)} hosts — tu IP {self.own_ip or '?'}[/dim]\n")
-        self.run_once()  # ya registra known + snapshot inicial
+        # Instantáneo: la TUI pinta al momento y el escaneo rellena en 2º plano.
+        self._start_scan_background()
 
         old = _raw()
 
@@ -1702,10 +1970,10 @@ class LANRadarApp:
             with Live(
                 self.build_renderable(),
                 console=console,
-                refresh_per_second=2,
+                refresh_per_second=4,
                 screen=True,
             ) as live:
-                next_scan = time.time() + self.interval
+                next_due = float("inf")  # se programa al terminar cada escaneo
                 while True:
                     if old is None:
                         time.sleep(0.05)
@@ -1713,8 +1981,9 @@ class LANRadarApp:
                         ch = _read_key(0.05)
                         if b"q" in ch or b"\x03" in ch:
                             break
-                        if b"r" in ch:
-                            next_scan = time.time()
+                        if b"r" in ch and not self.scanning:
+                            self._start_scan_background(verbose=True)
+                            next_due = float("inf")
                         if b"c" in ch:
                             self.history.events.clear()
                             self.history.snapshots.clear()
@@ -1732,17 +2001,20 @@ class LANRadarApp:
                         if quit_:
                             break
                         live.start()
-                        next_scan = time.time() + self.interval
+                        next_due = time.time() + self.interval
                         continue
 
-                    if time.time() >= next_scan:
-                        _, _, _, fresh = self.run_once()
+                    finished = self._poll_scan_finished()
+                    if finished is not None:
+                        _, _, _, fresh = finished
                         pending.extend(fresh)
-                        live.update(self.build_renderable())
-                        next_scan = time.time() + self.interval
-                    else:
-                        live.update(self.build_renderable())
-                        time.sleep(0.5)
+                        next_due = time.time() + self.interval
+                    elif not self.scanning and time.time() >= next_due:
+                        self._start_scan_background()
+                        next_due = float("inf")
+
+                    live.update(self.build_renderable())
+                    time.sleep(0.15)
         except KeyboardInterrupt:
             pass
         finally:
@@ -1831,16 +2103,34 @@ def main():
         console.print(f"[dim]Escaneando {nets_label(networks)} ({total} hosts)...[/dim]")
         console.print("[dim]Ping + TCP→ARP (mudos) + nombres (router/mDNS/UPnP)...[/dim]")
         start = time.time()
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=None),
-            TextColumn("[dim]{task.completed}/{task.total}[/dim]"),
-            console=console,
-            transient=True,
-        ) as prog:
-            task = prog.add_task(f"ping {nets_label(networks)}", total=total)
-            devices = scanner.scan(progress_cb=lambda done, _t: prog.update(task, completed=done))
+        # Lazy: la tabla aparece al instante y se rellena según caen los hits.
+        state = {"devices": [], "detail": "arrancando…"}
+
+        def _once_renderable():
+            t = render_table(state["devices"], scanner.own_ip, scanning=True)
+            info = Text(
+                f" ⏳ Todavía escaneando… {state['detail']} • "
+                f"{len(state['devices'])} encontrados — van apareciendo",
+                style="yellow",
+                justify="center",
+            )
+            grid = Table.grid(expand=True)
+            grid.add_column()
+            grid.add_row(t)
+            grid.add_row(info)
+            return grid
+
+        with Live(_once_renderable(), console=console, refresh_per_second=4) as live:
+            devices = scanner.scan_with_updates(
+                on_upsert=lambda snap: (state.update(devices=snap), live.update(_once_renderable())),
+                on_progress=lambda ph, d, t: (state.update(
+                    detail=(
+                        f"ping {d}/{t}" if ph == "ping" else
+                        "TCP→ARP cazando mudos…" if ph == "arp" else
+                        f"nombres {d}/{t}" if ph == "nombres" else "puertos…"
+                    )), live.update(_once_renderable())),
+            )
+            live.update(render_table(devices, scanner.own_ip))
         elapsed = time.time() - start
         console.print(render_table(devices, scanner.own_ip))
         avg = _avg_lat(devices)
